@@ -8,7 +8,14 @@ JOINT_NAMES = ['1_Joint', '2_Joint', '3_Joint', '4_Joint', '5_Joint', '6_Joint']
 # Tabla DH del JetCobot: una fila (alpha_rad, a_mm, d_mm, theta_offset_rad) por
 # articulación, en convención DH estándar. Dedúzcanla y verifíquenla con
 # herramientas/verificar_fk.py contra el robot: criterio ≤ 10 mm.
-DH = []
+DH = [
+    (math.pi / 2, 0.0, 131.22, 0.0),
+    (0.0, -110.4, 0.0, -math.pi / 2),
+    (0.0, -96.0, 0.0, 0.0),
+    (math.pi / 2, 0.0, 63.4, -math.pi / 2),
+    (-math.pi / 2, 0.0, 75.05, math.pi / 2),
+    (0.0, 0.0, 45.6, 0.0),
+]
 
 JOINT_LIMITS = [
     (-2.93, 2.93),
@@ -52,7 +59,8 @@ def fk(q):
     Con la tabla DH llena, fk_matriz(q) ya devuelve la matriz homogénea: la
     posición son sus tres primeros elementos de la última columna.
     """
-    raise NotImplementedError('Ítem 1: devuelvan (x, y, z) a partir de fk_matriz(q)')
+    T = fk_matriz(q)
+    return T[0][3], T[1][3], T[2][3]
 # =================================================================================
 
 
