@@ -46,14 +46,33 @@ class FIFO(Politica):
     nombre = 'fifo'
 
     def siguiente(self, pendientes):
-        raise NotImplementedError('El que llegó primero')
+        if not pendientes:
+            return None
+        return 0
 
 
 class SegundaPolitica(Politica):
     nombre = 'prioridad'
 
+    def __init__(self, tau_envejecimiento_s=8.0):
+        self.tau_envejecimiento_s = float(tau_envejecimiento_s)
+
     def siguiente(self, pendientes):
-        raise NotImplementedError('La política que elijan')
+        if not pendientes:
+            return None
+
+        # Selección por prioridad más alta + envejecimiento.
+        # Mayor prioridad = más urgente.
+        # En caso de empate, atiende al pedido que llegó primero (-t_llegada).
+        def clave(item):
+            p = item[1]
+            tau = self.tau_envejecimiento_s
+            aging = (p.espera_s / tau) if tau > 0.0 else 0.0
+            prio_efectiva = p.priority + aging
+            return (prio_efectiva, -p.t_llegada)
+
+        idx_max, _ = max(enumerate(pendientes), key=clave)
+        return idx_max
 
 # =================================================================================
 

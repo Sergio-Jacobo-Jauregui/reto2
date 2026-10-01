@@ -17,8 +17,12 @@ from sensor_msgs.msg import JointState
 from arm_broker_interfaces.action import MoveArm
 from arm_broker_interfaces.msg import QueueState
 
-from src.arm_broker.arm_broker import fk
-from src.arm_broker.arm_broker.politicas import POLITICAS, Pedido
+try:
+    from arm_broker import fk
+    from arm_broker.politicas import POLITICAS, Pedido
+except ImportError:
+    from src.arm_broker.arm_broker import fk
+    from src.arm_broker.arm_broker.politicas import POLITICAS, Pedido
 
 
 class ArmBroker(Node):
@@ -86,55 +90,156 @@ class ArmBroker(Node):
 
     # ========================= IMPLEMENTAR · ítem 2 ==========================
     def goal_callback(self, goal_request):
-        """Admisión. Barata e inmediata: acepta o rechaza, nunca ejecuta.
+        """Admisión. Barata e inmediata: acepta o rechaza, nunca ejecuta."""
+        q = list(goal_request.joint_positions)
 
-        Rechacen con motivo explícito si el objetivo está fuera de límites
-        articulares, fuera del workspace, o si el paso articular desde
-        self.q_actual es mayor que self.paso_max. Usen fk.dentro_de_limites,
-        fk.dentro_del_workspace y fk.paso_articular.
+        ok_lim, msg_lim = fk.dentro_de_limites(q)
+        if not ok_lim:
+            self.get_logger().warn(f'Goal rechazado (límites): {msg_lim}')
+            with self.lock:
+                self.n_rechazados += 1
+            return GoalResponse.REJECT
 
-        Lleven la cuenta en self.n_aceptados y self.n_rechazados.
-        Devuelve GoalResponse.ACCEPT o GoalResponse.REJECT.
-        """
-        raise NotImplementedError('Admisión validada con FK')
+        ok_ws, msg_ws = fk.dentro_del_workspace(q)
+        if not ok_ws:
+            self.get_logger().warn(f'Goal rechazado (workspace): {msg_ws}')
+            with self.lock:
+                self.n_rechazados += 1
+            return GoalResponse.REJECT
+
+        with self.lock:
+            q_act = list(self.q_actual)
+            len_cola = len(self.pendientes)
+
+        paso = fk.paso_articular(q_act, q)
+        if paso > self.paso_max:
+            self.get_logger().warn(
+                f'Goal rechazado (paso {paso:.2f} rad > máximo {self.paso_max:.2f} rad)'
+            )
+            with self.lock:
+                self.n_rechazados += 1
+            return GoalResponse.REJECT
+
+        if len_cola >= self.cola_max:
+            self.get_logger().warn(f'Goal rechazado (cola llena: {len_cola}/{self.cola_max})')
+            with self.lock:
+                self.n_rechazados += 1
+            return GoalResponse.REJECT
+
+        with self.lock:
+            self.n_aceptados += 1
+
+        return GoalResponse.ACCEPT
 
     def handle_accepted_callback(self, goal_handle):
-        """Encolar. AQUÍ NO SE EJECUTA NADA, y no se publica en /joint_states.
+        """Encolar. AQUÍ NO SE EJECUTA NADA, y no se publica en /joint_states."""
+        req = goal_handle.request
+        pedido = Pedido(goal_handle, req.client_id, req.priority, req.joint_positions)
 
-        Construyan un Pedido y guárdenlo en self.pendientes bajo self.lock.
-        Indéxenlo también en self.por_goal_id, que el worker lo va a necesitar.
-        """
-        raise NotImplementedError('Encolar')
+        with self.lock:
+            self.pendientes.append(pedido)
+            self.por_goal_id[pedido.goal_id] = pedido
 
     def _worker(self):
-        """El único que decide a quién le toca. Corre en su propio hilo.
+        """El único que decide a quién le toca. Corre en su propio hilo."""
+        while not self._parar.is_set():
+            pedido = None
+            with self.lock:
+                if self.ejecutando is None and self.pendientes:
+                    idx = self.politica.siguiente(self.pendientes)
+                    if idx is not None and 0 <= idx < len(self.pendientes):
+                        pedido = self.pendientes.pop(idx)
 
-        En bucle, mientras no self._parar:
-          - si no hay nada ejecutándose y hay pendientes, pregunten a
-            self.politica.siguiente() cuál sigue y sáquenlo de la cola
-          - si venía cancelado, descártenlo
-          - si no, márquenlo en self.ejecutando, anoten t_inicio_ejec, y llamen
-            a goal_handle.execute()
-          - esperen a que termine con pedido.fin.wait() ANTES de sacar el
-            siguiente: ahí está la exclusión mutua
-          - al terminar, limpien self.ejecutando y avisen a la política con
+            if pedido is None:
+                time.sleep(0.05)
+                continue
+
+            if pedido.goal_handle.is_cancel_requested:
+                pedido.goal_handle.canceled()
+                with self.lock:
+                    self.por_goal_id.pop(pedido.goal_id, None)
+                continue
+
+            with self.lock:
+                pedido.t_inicio_ejec = time.time()
+                self.ejecutando = pedido
+
+            pedido.goal_handle.execute()
+
+            # Esperar a que termine la ejecución con exclusión mutua
+            pedido.fin.wait()
+
+            with self.lock:
+                self.ejecutando = None
+                self.por_goal_id.pop(pedido.goal_id, None)
+
             self.politica.atendido(pedido)
-        """
-        raise NotImplementedError('Worker único: desencolar y ejecutar de a uno')
 
     def execute_callback(self, goal_handle):
-        """Ejecutar UN pedido. Lo llama el worker, nunca handle_accepted.
+        """Ejecutar UN pedido. Lo llama el worker, nunca handle_accepted."""
+        goal_id = bytes(goal_handle.goal_id.uuid).hex()[:12]
+        with self.lock:
+            pedido = self.por_goal_id.get(goal_id)
 
-        Busquen el Pedido en self.por_goal_id por el id del goal. Interpolen
-        desde self.q_actual hasta el destino en self.pasos pasos, publicando
-        con self.mover() y mandando feedback en cada uno. Comprueben
-        goal_handle.is_cancel_requested en cada paso.
+        if not pedido:
+            res = MoveArm.Result()
+            res.success = False
+            res.message = 'Pedido no encontrado'
+            goal_handle.abort()
+            return res
 
-        Terminen con goal_handle.succeed() y devuelvan el Result con
-        wait_time_s y exec_time_s. Pase lo que pase, pedido.fin.set() al final:
-        si no, el worker se queda esperando para siempre.
-        """
-        raise NotImplementedError('Ejecutar con feedback y cancelación')
+        t_inicio = time.time()
+        wait_time_s = (
+            pedido.t_inicio_ejec - pedido.t_llegada
+            if pedido.t_inicio_ejec
+            else (t_inicio - pedido.t_llegada)
+        )
+
+        q_destino = pedido.joint_positions
+        with self.lock:
+            q_inicio = list(self.q_actual)
+
+        dt = self.duracion / float(self.pasos)
+        cancelado = False
+
+        try:
+            for step in range(1, self.pasos + 1):
+                if goal_handle.is_cancel_requested:
+                    cancelado = True
+                    break
+
+                frac = step / float(self.pasos)
+                q_interp = [q_inicio[i] + frac * (q_destino[i] - q_inicio[i]) for i in range(6)]
+                self.mover(q_interp)
+
+                fb = MoveArm.Feedback()
+                fb.state = 'EXECUTING'
+                fb.queue_position = 0
+                fb.elapsed_s = time.time() - t_inicio
+                goal_handle.publish_feedback(fb)
+
+                time.sleep(dt)
+
+            exec_time_s = time.time() - t_inicio
+            res = MoveArm.Result()
+            res.wait_time_s = float(wait_time_s)
+            res.exec_time_s = float(exec_time_s)
+
+            if cancelado or goal_handle.is_cancel_requested:
+                res.success = False
+                res.message = 'Movimiento cancelado'
+                goal_handle.canceled()
+            else:
+                res.success = True
+                res.message = 'Movimiento completado con éxito'
+                with self.lock:
+                    self.n_completados += 1
+                goal_handle.succeed()
+
+            return res
+
+        finally:
+            pedido.fin.set()
     # =========================================================================
 
     def cancel_callback(self, goal_handle):
